@@ -1,113 +1,86 @@
-import sqlite3
-from datetime import datetime
+import os
+import time
 import json
-from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+from typing import Any, Dict, List, Tuple, Optional
 
-# Single SQLite file for the whole app
 DB_PATH = "peisr_runs.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+def _to_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return json.dumps({"_repr": repr(value)}, ensure_ascii=False)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT,
 
-        task_tag TEXT,
-        query TEXT,
-        refined_prompt TEXT,
+def _is_postgres() -> bool:
+    return bool(DATABASE_URL)
 
-        answer_a TEXT,
-        answer_b TEXT,
 
-        -- Per-metric scores (Baseline A)
-        intent_a INTEGER,
-        clarity_a INTEGER,
-        structure_a INTEGER,
-        safety_a INTEGER,
+def _connect_sqlite():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
 
-        -- Per-metric scores (Refined B)
-        intent_b INTEGER,
-        clarity_b INTEGER,
-        structure_b INTEGER,
-        safety_b INTEGER,
 
-        score_a INTEGER,
-        score_b INTEGER,
+def _connect_postgres():
+    import psycopg2  # from psycopg2-binary
+    return psycopg2.connect(DATABASE_URL)
 
-        winner TEXT,
-        judge_json TEXT
-    )
-    """)
 
-    # New: human-rated comparisons (replaces Excel logging)
-    # NOTE: SQLite has no native JSON type -> we store JSON blobs as TEXT.
-    cur.execute("""
+def init_db() -> None:
+    ddl = """
     CREATE TABLE IF NOT EXISTS comparisons (
         comparison_id TEXT PRIMARY KEY,
         run_id TEXT,
-        ts TEXT,
-
         session_id TEXT,
+        ts DOUBLE PRECISION,
         human_rater TEXT,
         user_tag TEXT,
-
         variant TEXT,
         temp_mode TEXT,
         threshold_mode TEXT,
         model_mode TEXT,
-
         user_input TEXT,
         route_predicted TEXT,
-        temperature_used REAL,
+        temperature_used DOUBLE PRECISION,
         rewrite_threshold_used INTEGER,
         rewritten INTEGER,
-
         original_prompt TEXT,
         original_response TEXT,
-        original_prompt_critique_json TEXT,
-        original_prompt_heuristic_json TEXT,
-
+        original_prompt_critique TEXT,
+        original_prompt_heuristic TEXT,
         enhanced_prompt TEXT,
         enhanced_response TEXT,
-        enhanced_prompt_critique_json TEXT,
-        enhanced_prompt_heuristic_json TEXT,
-
-        response_llm_judge_json TEXT,
-        response_heuristic_judge_json TEXT,
-
+        enhanced_prompt_critique TEXT,
+        enhanced_prompt_heuristic TEXT,
+        response_llm_judge TEXT,
+        response_heuristic_judge TEXT,
         human_score_original INTEGER,
         human_score_enhanced INTEGER,
         human_pick TEXT,
         human_notes TEXT
-    )
-    """)
+    );
+    """
 
-    # --- lightweight migration for older DBs ---
-    cur.execute("PRAGMA table_info(comparisons)")
-    existing_cols = {row[1] for row in cur.fetchall()}
-    desired_cols = {
-        "run_id": "TEXT",
-        "session_id": "TEXT",
-        "user_tag": "TEXT",
-        "variant": "TEXT",
-        "temp_mode": "TEXT",
-        "threshold_mode": "TEXT",
-        "model_mode": "TEXT",
-        "original_prompt_heuristic_json": "TEXT",
-        "enhanced_prompt_heuristic_json": "TEXT",
-        "response_llm_judge_json": "TEXT",
-        "response_heuristic_judge_json": "TEXT",
-    }
-    for col, col_type in desired_cols.items():
-        if col not in existing_cols:
-            cur.execute(f"ALTER TABLE comparisons ADD COLUMN {col} {col_type}")
+    if _is_postgres():
+        conn = _connect_postgres()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(ddl)
+        finally:
+            conn.close()
+        return
 
-    conn.commit()
-    conn.close()
+    conn = _connect_sqlite()
+    try:
+        cur = conn.cursor()
+        cur.execute(ddl)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def save_comparison(
@@ -140,216 +113,107 @@ def save_comparison(
     human_score_enhanced: int,
     human_pick: str,
     human_notes: str,
-):
-    """Persist one human-rated A/B comparison to SQLite."""
+) -> None:
+    ts = time.time()
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO comparisons (
-            comparison_id,
-            run_id,
-            ts,
-
-            session_id,
-            human_rater,
-            user_tag,
-
-            variant,
-            temp_mode,
-            threshold_mode,
-            model_mode,
-
-            user_input,
-            route_predicted,
-            temperature_used,
-            rewrite_threshold_used,
-            rewritten,
-
-            original_prompt,
-            original_response,
-            original_prompt_critique_json,
-            original_prompt_heuristic_json,
-
-            enhanced_prompt,
-            enhanced_response,
-            enhanced_prompt_critique_json,
-            enhanced_prompt_heuristic_json,
-
-            response_llm_judge_json,
-            response_heuristic_judge_json,
-
-            human_score_original,
-            human_score_enhanced,
-            human_pick,
-            human_notes
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            comparison_id,
-            run_id,
-            datetime.now().isoformat(timespec="seconds"),
-            session_id,
-            human_rater,
-            user_tag,
-            variant,
-            temp_mode,
-            threshold_mode,
-            model_mode,
-            user_input,
-            route_predicted,
-            float(temperature_used),
-            int(rewrite_threshold_used),
-            1 if rewritten else 0,
-            original_prompt,
-            original_response,
-            json.dumps(original_prompt_critique or {}, ensure_ascii=False),
-            json.dumps(original_prompt_heuristic or {}, ensure_ascii=False),
-            enhanced_prompt,
-            enhanced_response,
-            json.dumps(enhanced_prompt_critique or {}, ensure_ascii=False),
-            json.dumps(enhanced_prompt_heuristic or {}, ensure_ascii=False),
-            json.dumps(response_llm_judge or {}, ensure_ascii=False),
-            json.dumps(response_heuristic_judge or {}, ensure_ascii=False),
-            int(human_score_original),
-            int(human_score_enhanced),
-            human_pick,
-            human_notes or "",
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def fetch_comparisons(limit: int = 200) -> List[Tuple]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            comparison_id,
-            ts,
-            human_rater,
-            route_predicted,
-            temperature_used,
-            rewrite_threshold_used,
-            rewritten,
-            human_score_original,
-            human_score_enhanced,
-            human_pick,
-            user_input
-        FROM comparisons
-        ORDER BY ts DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def save_run(
-    task_tag: str,
-    query: str,
-    refined_prompt: str,
-    answer_a: str,
-    answer_b: str,
-    judge_json: str,
-    winner: str,
-    score_a: int,
-    score_b: int,
-    intent_a: int,
-    clarity_a: int,
-    structure_a: int,
-    safety_a: int,
-    intent_b: int,
-    clarity_b: int,
-    structure_b: int,
-    safety_b: int,
-):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("""
-    INSERT INTO runs (
+    row = (
+        comparison_id,
+        run_id,
+        session_id,
         ts,
-        task_tag,
-        query,
-        refined_prompt,
-        answer_a,
-        answer_b,
-        intent_a,
-        clarity_a,
-        structure_a,
-        safety_a,
-        intent_b,
-        clarity_b,
-        structure_b,
-        safety_b,
-        score_a,
-        score_b,
-        winner,
-        judge_json
+        human_rater,
+        user_tag,
+        variant,
+        temp_mode,
+        threshold_mode,
+        model_mode,
+        user_input,
+        route_predicted,
+        float(temperature_used),
+        int(rewrite_threshold_used),
+        1 if rewritten else 0,
+        original_prompt,
+        original_response,
+        _to_json(original_prompt_critique),
+        _to_json(original_prompt_heuristic),
+        enhanced_prompt,
+        enhanced_response,
+        _to_json(enhanced_prompt_critique),
+        _to_json(enhanced_prompt_heuristic),
+        _to_json(response_llm_judge),
+        _to_json(response_heuristic_judge),
+        int(human_score_original),
+        int(human_score_enhanced),
+        human_pick,
+        human_notes,
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        datetime.now().isoformat(timespec="seconds"),
-        task_tag,
-        query,
-        refined_prompt,
-        answer_a,
-        answer_b,
-        intent_a,
-        clarity_a,
-        structure_a,
-        safety_a,
-        intent_b,
-        clarity_b,
-        structure_b,
-        safety_b,
-        score_a,
-        score_b,
-        winner,
-        judge_json
-    ))
 
-    conn.commit()
-    conn.close()
+    placeholders = ",".join(["%s"] * len(row)) if _is_postgres() else ",".join(["?"] * len(row))
+
+    sql = f"""
+    INSERT INTO comparisons (
+        comparison_id, run_id, session_id, ts, human_rater, user_tag, variant,
+        temp_mode, threshold_mode, model_mode, user_input, route_predicted,
+        temperature_used, rewrite_threshold_used, rewritten,
+        original_prompt, original_response, original_prompt_critique, original_prompt_heuristic,
+        enhanced_prompt, enhanced_response, enhanced_prompt_critique, enhanced_prompt_heuristic,
+        response_llm_judge, response_heuristic_judge,
+        human_score_original, human_score_enhanced, human_pick, human_notes
+    ) VALUES ({placeholders});
+    """
+
+    if _is_postgres():
+        conn = _connect_postgres()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, row)
+        finally:
+            conn.close()
+        return
+
+    conn = _connect_sqlite()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, row)
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def fetch_runs(limit: int = 50):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("""
+def fetch_comparisons(limit: int = 10) -> List[Tuple[Any, ...]]:
+    sql = """
     SELECT
-        id,
+        comparison_id,
         ts,
-        task_tag,
-        query,
-        winner,
-        score_a,
-        score_b,
-        intent_a,
-        clarity_a,
-        structure_a,
-        safety_a,
-        intent_b,
-        clarity_b,
-        structure_b,
-        safety_b
-    FROM runs
-    ORDER BY id DESC
-    LIMIT ?
-    """, (limit,))
+        human_rater,
+        route_predicted,
+        temperature_used,
+        rewrite_threshold_used,
+        rewritten,
+        human_score_original,
+        human_score_enhanced,
+        human_pick,
+        user_input
+    FROM comparisons
+    ORDER BY ts DESC
+    LIMIT %s;
+    """
 
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    if _is_postgres():
+        conn = _connect_postgres()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(limit),))
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    # sqlite uses ? not %s
+    conn = _connect_sqlite()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql.replace("%s", "?"), (int(limit),))
+        return cur.fetchall()
+    finally:
+        conn.close()
