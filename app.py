@@ -3,7 +3,6 @@ import time
 import hashlib
 import streamlit as st
 import pandas as pd
-
 import os
 
 from answerer import run_pipeline
@@ -31,13 +30,12 @@ init_db()
 if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
 
-# Session identifiers
-if "session_id" not in st.session_state:
-    st.session_state["session_id"] = str(uuid.uuid4())
+# Other session state
 if "saved_ids" not in st.session_state:
     st.session_state["saved_ids"] = set()
 if "last_submit_ts" not in st.session_state:
     st.session_state["last_submit_ts"] = 0.0
+
 
 # ------------------ SIDEBAR SETTINGS ------------------
 with st.sidebar:
@@ -56,24 +54,30 @@ with st.sidebar:
         key="user_tag",
     )
 
-    # Admin mode so judge JSON doesn't influence public raters
+    # --- Admin mode (sidebar only) ---
     admin_secret = os.getenv("ADMIN_KEY", "").strip()
 
-# Only show the input if an ADMIN_KEY exists in the environment
-admin_key = ""
-if admin_secret:
-    admin_key = st.text_input("Admin key (optional)", value="", type="password", key="admin_key")
+    admin_key = ""
+    if admin_secret:
+        admin_key = st.text_input(
+            "Admin key (optional)",
+            value="",
+            type="password",
+            key="admin_key",
+        )
 
-is_admin = bool(admin_secret) and (admin_key == admin_secret)
+    is_admin = bool(admin_secret) and (admin_key == admin_secret)
 
-show_judge_json = False
-if is_admin:
-    show_judge_json = _toggle("Show judge JSON (admin)", value=False, key="show_judge_json")
-    st.caption("✅ Admin mode enabled")
-else:
-    st.caption("Judge JSON hidden (public mode)")
+    show_judge_json = False
+    if is_admin:
+        show_judge_json = _toggle("Show judge JSON (admin)", value=False, key="show_judge_json")
+        st.caption("✅ Admin mode enabled")
+    else:
+        st.caption("Judge JSON hidden (public mode)")
 
+    st.divider()
 
+    # --- Controls (sidebar) ---
     auto_temp = _toggle("Auto temperature (by intent)", value=True, key="auto_temp")
     temperature = st.slider(
         "Answer temperature (used if auto OFF)",
@@ -82,56 +86,66 @@ else:
         0.4,
         0.05,
         disabled=auto_temp,
+        key="temperature",
     )
 
     auto_threshold = _toggle("Auto rewrite threshold (by intent)", value=True, key="auto_threshold")
     rewrite_threshold = st.slider(
         "Rewrite threshold (prompt total)",
-        4, 20, 15,
-        disabled=auto_threshold
+        4,
+        20,
+        15,
+        disabled=auto_threshold,
+        key="rewrite_threshold",
     )
 
     st.divider()
-    st.caption("SQLite logging")
-    st.write(f"DB: `{DB_PATH}`")
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH, "rb") as f:
-            st.download_button(
-                "Download SQLite DB",
-                data=f.read(),
-                file_name=DB_PATH,
-                mime="application/x-sqlite3",
-                use_container_width=True,
-            )
-    else:
-        st.info("No DB file yet. Submit a rating once to create it.")
 
-    # Quick view of latest ratings
-    st.caption("Latest ratings (preview)")
-    try:
-        rows = fetch_comparisons(limit=10)
-        if rows:
-            df = pd.DataFrame(
-                rows,
-                columns=[
-                    "comparison_id",
-                    "ts",
-                    "rater",
-                    "route",
-                    "temp",
-                    "threshold",
-                    "rewritten",
-                    "score_A",
-                    "score_B",
-                    "pick",
-                    "user_input",
-                ],
-            )
-            st.dataframe(df, use_container_width=True, height=240)
+    # --- DB controls: ADMIN ONLY ---
+    if is_admin:
+        st.caption("SQLite logging (admin)")
+        st.write(f"DB: `{DB_PATH}`")
+
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, "rb") as f:
+                st.download_button(
+                    "Download SQLite DB",
+                    data=f.read(),
+                    file_name=DB_PATH,
+                    mime="application/x-sqlite3",
+                    use_container_width=True,
+                )
         else:
-            st.caption("(no ratings yet)")
-    except Exception:
-        st.caption("(preview unavailable)")
+            st.info("No DB file yet. Submit a rating once to create it.")
+
+        st.caption("Latest ratings (preview)")
+        try:
+            rows = fetch_comparisons(limit=10)
+            if rows:
+                df = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "comparison_id",
+                        "ts",
+                        "rater",
+                        "route",
+                        "temp",
+                        "threshold",
+                        "rewritten",
+                        "score_A",
+                        "score_B",
+                        "pick",
+                        "user_input",
+                    ],
+                )
+                st.dataframe(df, use_container_width=True, height=240)
+            else:
+                st.caption("(no ratings yet)")
+        except Exception:
+            st.caption("(preview unavailable)")
+    else:
+        st.caption("✅ Tip: Results are saved only when you **Submit rating**.")
+
 
 # ------------------ INPUT ------------------
 
@@ -143,6 +157,7 @@ query = st.text_area(
 )
 
 run = st.button("Run", type="primary", use_container_width=True)
+
 
 # ------------------ RUN PIPELINE ------------------
 if run:
@@ -178,7 +193,6 @@ if run:
     rewritten = enhanced.enhanced_prompt.strip() != q
 
     # --- Computer judges (LLM + heuristic) ---
-    # Prompt judge: LLM critique is already produced by pipeline (critique_original / critique_final)
     llm_prompt_original = enhanced.critique_original or {}
     llm_prompt_enhanced = enhanced.critique_final or llm_prompt_original or {}
 
@@ -188,22 +202,30 @@ if run:
     # Response judge: LLM pairwise judge + heuristic pairwise judge
     try:
         llm_resp_judge = judge_pair(q, base.answer, enhanced.answer)
-        llm_resp_judge_json = {"X": llm_resp_judge.X, "Y": llm_resp_judge.Y, "winner": llm_resp_judge.winner, "reason": llm_resp_judge.reason, "judge_type": "llm"}
+        llm_resp_judge_json = {
+            "X": llm_resp_judge.X,
+            "Y": llm_resp_judge.Y,
+            "winner": llm_resp_judge.winner,
+            "reason": llm_resp_judge.reason,
+            "judge_type": "llm",
+        }
     except Exception as e:
         llm_resp_judge_json = {"error": str(e), "judge_type": "llm"}
 
     heur_resp_judge_json = heuristic_judge_pair(q, base.answer, enhanced.answer)
 
     # Stable run_id for dedupe (same run -> same id)
-    run_id_src = "|".join([
-        q,
-        enhanced.route,
-        f"{enhanced.temperature_used:.3f}",
-        str(enhanced.rewrite_threshold_used),
-        enhanced.enhanced_prompt,
-        base.answer,
-        enhanced.answer,
-    ])
+    run_id_src = "|".join(
+        [
+            q,
+            enhanced.route,
+            f"{enhanced.temperature_used:.3f}",
+            str(enhanced.rewrite_threshold_used),
+            enhanced.enhanced_prompt,
+            base.answer,
+            enhanced.answer,
+        ]
+    )
     run_id = hashlib.sha256(run_id_src.encode("utf-8")).hexdigest()
 
     # Store everything in session for rating submit
@@ -233,6 +255,7 @@ if run:
         "resp_heur_judge": heur_resp_judge_json,
     }
 
+
 # ------------------ DISPLAY (if we have last result) ------------------
 res = st.session_state.get("last_result")
 if res:
@@ -241,7 +264,6 @@ if res:
         f"Threshold used: **{res['threshold_used']}** | Rewritten: **{res['rewritten']}**"
     )
 
-    # -------- Two-column comparison --------
     st.markdown("## Side-by-side comparison")
     colL, colR = st.columns(2, gap="large")
 
@@ -252,16 +274,12 @@ if res:
         st.markdown("**Response**")
         st.write(res["original_response"])
 
-        # Judge JSON is intentionally hidden from public raters to avoid bias.
-
     with colR:
         st.markdown("### B) Rewritten/enhanced prompt")
         st.markdown("**Prompt**")
         st.code(res["enhanced_prompt"])
         st.markdown("**Response**")
         st.write(res["enhanced_response"])
-
-        # Judge JSON is intentionally hidden from public raters to avoid bias.
 
     # Admin-only: show machine judge JSON (prompt + response)
     if show_judge_json:
@@ -287,9 +305,8 @@ if res:
 
     st.divider()
 
-    # -------- Human rating --------
     st.markdown("## Human rating")
-    st.caption("Rate both responses, then choose which one is better. This will be logged to SQLite.")
+    st.caption("Rate both responses, then choose which one is better. Submitting saves everything.")
 
     rcol1, rcol2 = st.columns(2, gap="large")
     with rcol1:
@@ -317,14 +334,17 @@ if res:
     )
     notes = st.text_area("Optional notes (why?)", height=80, key="notes")
 
-    submit = st.button("Submit rating (log to SQLite)", use_container_width=True)
+    submit = st.button("Submit rating", use_container_width=True)
 
     if submit:
-        # basic anti-spam cooldown
         now = time.time()
+
+        # basic anti-spam cooldown
         if now - float(st.session_state.get("last_submit_ts", 0.0)) < 3.0:
             st.warning("Please wait a couple seconds before submitting again.")
             st.stop()
+
+        # prevent double-save for same displayed result
         if res["comparison_id"] in st.session_state.get("saved_ids", set()):
             st.info("This rating was already saved for the current run.")
             st.stop()
