@@ -135,12 +135,9 @@ def generate_text(system: str, user: str, temperature: float = 0.2) -> str:
 
 def generate_json(system: str, user: str, temperature: float = 0.0) -> dict:
     """
-    Best-effort JSON output from Gemini.
-    - Uses response_mime_type on google-genai.
-    - Still safely parses and never throws JSONDecodeError.
+    Robust JSON generation with fallback.
+    NEVER crashes the app.
     """
-    txt = ""
-
     if _SDK == "google-genai":
         resp = client.models.generate_content(
             model=MODEL,
@@ -151,11 +148,8 @@ def generate_json(system: str, user: str, temperature: float = 0.0) -> dict:
                 response_mime_type="application/json",
             ),
         )
-        txt = (resp.text or "").strip()
-
+        raw = (resp.text or "").strip()
     else:
-        # google-generativeai: ask for JSON in prompt (best-effort)
-        # (Keeping your original behavior, but safe-parse)
         resp = genai.GenerativeModel(
             model_name=MODEL,
             system_instruction=system,
@@ -163,6 +157,28 @@ def generate_json(system: str, user: str, temperature: float = 0.0) -> dict:
             user,
             generation_config={"temperature": temperature},
         )
-        txt = (getattr(resp, "text", "") or "").strip()
+        raw = (getattr(resp, "text", "") or "").strip()
 
-    return _safe_json_load(txt)
+    import json
+    import re
+
+    # 1️⃣ Empty response → safe fallback
+    if not raw:
+        return {}
+
+    # 2️⃣ Try direct JSON parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # 3️⃣ Try extracting JSON block
+    try:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    except Exception:
+        pass
+
+    # 4️⃣ Final fallback
+    return {}

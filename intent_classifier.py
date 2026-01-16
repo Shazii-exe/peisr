@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Any, Dict
 
 from gemini_client import generate_json
 from prompts import CLASSIFIER_SYSTEM
@@ -37,6 +37,26 @@ _CREATIVE_HINTS = re.compile(
     re.IGNORECASE,
 )
 
+_ALLOWED: set[str] = {"SOCIAL", "QA", "TASK", "TECH", "CREATIVE"}
+
+
+def _clamp01(x: Any, default: float = 0.5) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return default
+    if v != v:  # NaN
+        return default
+    return max(0.0, min(1.0, v))
+
+
+def _normalize_route(x: Any) -> Route:
+    try:
+        s = str(x).strip().upper()
+    except Exception:
+        return "QA"
+    return s if s in _ALLOWED else "QA"  # type: ignore[return-value]
+
 
 def _rule_route(text: str) -> Optional[IntentResult]:
     t = (text or "").strip()
@@ -67,10 +87,9 @@ def _rule_route(text: str) -> Optional[IntentResult]:
 
 
 def classify_intent(text: str, *, allow_llm: bool = True) -> IntentResult:
-    """Classify a user message into a route.
-
-    We do fast rules first (cheap + deterministic). If uncertain and allow_llm,
-    we fall back to an LLM classifier.
+    """
+    Fast rules first. If rules don't decide and allow_llm=True, ask the LLM.
+    This function is hardened: it NEVER throws due to bad/empty JSON.
     """
 
     rule = _rule_route(text)
@@ -80,21 +99,28 @@ def classify_intent(text: str, *, allow_llm: bool = True) -> IntentResult:
     if not allow_llm:
         return IntentResult(route="QA", confidence=0.4, reason="default QA (no llm)")
 
-    data = generate_json(
-        system=CLASSIFIER_SYSTEM,
-        user=f"User message:\n{text}\n",
-        temperature=0.0,
-    )
-    route = data.get("route", "QA")
-    conf = float(data.get("confidence", 0.5))
-    reason = str(data.get("reason", ""))
-    if route not in {"SOCIAL", "QA", "TASK", "TECH", "CREATIVE"}:
-        route = "QA"
+    # LLM fallback (hardened)
+    try:
+        data = generate_json(
+            system=CLASSIFIER_SYSTEM,
+            user=f"User message:\n{text}\n",
+            temperature=0.0,
+        )
+    except Exception as e:
+        return IntentResult(route="QA", confidence=0.3, reason=f"llm classify failed: {type(e).__name__}")
+
+    if not isinstance(data, dict):
+        return IntentResult(route="QA", confidence=0.3, reason="llm returned non-dict")
+
+    route: Route = _normalize_route(data.get("route", "QA"))
+    conf = _clamp01(data.get("confidence", 0.5), default=0.5)
+    reason = str(data.get("reason", "") or "llm classified")
+
     return IntentResult(route=route, confidence=conf, reason=reason)
 
 
 def choose_temperature(route: Route) -> float:
-    """Step 3: Temperature policy (rule-based auto selection)."""
+    """Temperature policy (rule-based auto selection)."""
     return {
         "SOCIAL": 0.8,
         "CREATIVE": 1.0,
@@ -103,16 +129,10 @@ def choose_temperature(route: Route) -> float:
         "TASK": 0.35,
     }[route]
 
+
 def choose_rewrite_threshold(intent: IntentResult) -> int:
-    """Auto rewrite threshold policy.
+    """Auto rewrite threshold policy (robust)."""
 
-    This threshold is compared against the critique total (sum of rubric scores).
-    A rewrite is triggered when: total < threshold.
-
-    Higher threshold => more aggressive rewriting.
-    We become *more conservative* (lower threshold) when intent confidence is low.
-    """
-    # Base aggressiveness by intent
     base_by_route = {
         "SOCIAL": 20,   # effectively unused because SOCIAL bypasses rewrite upstream
         "QA": 13,
@@ -121,15 +141,10 @@ def choose_rewrite_threshold(intent: IntentResult) -> int:
         "CREATIVE": 11,
     }
 
-    # Conservative floor when uncertain
     min_threshold = 9
     base = base_by_route[intent.route]
 
-    # Blend base with floor by confidence:
-    # - confidence 1.0 -> base
-    # - confidence 0.0 -> min_threshold
-    conf = max(0.0, min(1.0, float(intent.confidence)))
+    conf = _clamp01(intent.confidence, default=0.5)
     thr = round(base * conf + min_threshold * (1.0 - conf))
 
-    # Keep within UI slider range
     return int(max(4, min(20, thr)))
