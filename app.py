@@ -57,15 +57,22 @@ with st.sidebar:
     )
 
     # Admin mode so judge JSON doesn't influence public raters
-    admin_secret = os.getenv("ADMIN_KEY", "")
+    admin_secret = os.getenv("ADMIN_KEY", "").strip()
+
+# Only show the input if an ADMIN_KEY exists in the environment
+admin_key = ""
+if admin_secret:
     admin_key = st.text_input("Admin key (optional)", value="", type="password", key="admin_key")
-    is_admin = (admin_secret == "") or (admin_key == admin_secret)
-    show_judge_json = False
-    if is_admin:
-        show_judge_json = _toggle("Show judge JSON (admin)", value=False, key="show_judge_json")
-        st.caption("✅ Admin mode enabled")
-    else:
-        st.caption("Judge JSON hidden (public mode)")
+
+is_admin = bool(admin_secret) and (admin_key == admin_secret)
+
+show_judge_json = False
+if is_admin:
+    show_judge_json = _toggle("Show judge JSON (admin)", value=False, key="show_judge_json")
+    st.caption("✅ Admin mode enabled")
+else:
+    st.caption("Judge JSON hidden (public mode)")
+
 
     auto_temp = _toggle("Auto temperature (by intent)", value=True, key="auto_temp")
     temperature = st.slider(
