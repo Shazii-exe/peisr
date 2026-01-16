@@ -1,0 +1,5 @@
+.env
+peisr_runs.db
+__pycache__/
+.venv/
+*.log
